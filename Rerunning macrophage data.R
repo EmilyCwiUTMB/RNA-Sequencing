@@ -5,10 +5,13 @@ BiocManager::install(c("DESeq2", "edgeR", "clusterProfiler", "org.Mm.eg.db"))
 options(repos = BiocManager::repositories())
 
 #2. Load the libraries
-library(DESeq2)
-library(edgeR)
 library(clusterProfiler)
 library(org.Mm.eg.db)  
+
+if (!requireNamespace("conflicted", quietly = TRUE)) install.packages("conflicted")
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(dplyr::select)
+conflicted::conflicts_prefer(dplyr::mutate)
 
 ########################################Create metadata table
 
@@ -58,11 +61,22 @@ nrow(metadata)         # should equal number_of_samples
 # Preview the metadata table
 print(metadata)
 
+#Ensure that the count data and metadata table information match
+if (!identical(sort(sample_names), sort(rownames(metadata)))) {
+  stop("Error: Mismatch between sample names in count data and metadata!")
+}
+
 ####################################################################################################################################################################################
 
-# 9. Filter genes: throws out genes that don't reach count of 10 in at least half of the samples
-keep <- rowSums(raw_counts >= 10) >= (0.5 * ncol(raw_counts))
+# # Define filtering thresholds
+min_count <- 10
+min_samples <- 0.5 * ncol(raw_counts)
+
+# Apply filtering
+keep <- rowSums(raw_counts >= min_count) >= min_samples
 filtered_counts <- raw_counts[keep, ]
+message("After filtering, ", nrow(filtered_counts), " genes remain.")
+
 dim(filtered_counts)  # Check dimensions after filtering
 
 ##DESEq########################################
@@ -75,6 +89,10 @@ dds <- DESeqDataSetFromMatrix(countData = as.matrix(filtered_counts),
                               colData = metadata,
                               design = ~ condition)
 dds <- DESeq(dds)
+
+# Plot dispersion estimates
+plotDispEsts(dds)
+
 
 ###Setting Comparisons##
 ## DESeq2 uses negative binomial model with wALD Test to compare conditions
@@ -103,6 +121,222 @@ plotMA(res_WN_CN, main = "MA Plot: WN vs CN", ylim = c(-2, 2))
 
 
 
+###########################################################################################
+##Looping KEGG and GO analysis for all comparisons
+####################################################################################################
+### — Batch GO & KEGG for all comparisons — ###
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ggplot2)
+
+# Define comparisons and thresholds
+comparisons <- c("WN_WI", "CN_CI", "WI_CI", "WN_CN")
+padj.cut   <- 0.05
+lfc.cut    <- 1
+out.dir    <- "GO_KEGG_plots"
+dir.create(out.dir, showWarnings = FALSE)
+
+for (cmp in comparisons) {
+  # 1) grab results object
+  res.obj <- get(paste0("res_", cmp))
+  
+  # 2) filter DEGs
+  deg     <- res.obj[!is.na(res.obj$padj) & res.obj$padj < padj.cut & abs(res.obj$log2FoldChange) > lfc.cut, ]
+  genes   <- rownames(deg)
+  
+  # 3) map to Entrez
+  gene.df <- bitr(genes, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Mm.eg.db)
+  
+  # 4a) KEGG enrichment
+  kegg.enr <- enrichKEGG(
+    gene         = gene.df$ENTREZID,
+    organism     = "mmu",
+    pvalueCutoff = padj.cut
+  )
+  # 4b) GO enrichment (BP only)
+  go.enr <- enrichGO(
+    gene          = gene.df$ENTREZID,
+    OrgDb         = org.Mm.eg.db,
+    keyType       = "ENTREZID",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = padj.cut,
+    qvalueCutoff  = 0.2
+  )
+  
+  # 5) plotting + titles
+  p_kegg_dot <- dotplot(kegg.enr) + ggtitle(paste(cmp, "KEGG dotplot"))
+  p_kegg_bar <- barplot(kegg.enr) + ggtitle(paste(cmp, "KEGG barplot"))
+  p_go_dot   <- dotplot(go.enr, showCategory=10) + ggtitle(paste(cmp, "GO dotplot"))
+  p_go_bar   <- barplot(go.enr, showCategory=10) + ggtitle(paste(cmp, "GO barplot"))
+  
+  # 6) save
+  ggsave(file.path(out.dir, paste0(cmp, "_KEGG_dotplot.png")), plot=p_kegg_dot, width=8, height=6, dpi=300)
+  ggsave(file.path(out.dir, paste0(cmp, "_KEGG_barplot.png")), plot=p_kegg_bar, width=8, height=6, dpi=300)
+  ggsave(file.path(out.dir, paste0(cmp, "_GO_dotplot.png")),   plot=p_go_dot,   width=8, height=6, dpi=300)
+  ggsave(file.path(out.dir, paste0(cmp, "_GO_barplot.png")),   plot=p_go_bar,   width=8, height=6, dpi=300)
+}
+
+
+############################################################################################
+##Volcano PLots
+# Install necessary packages if not already installed
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(ggrepel)) install.packages("ggrepel")  # Optional, for better labels
+
+# Load libraries
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+
+# Read your DEG data
+deg <- read.csv("DEG_WI_CI.csv", header = TRUE, stringsAsFactors = FALSE)
+names(deg)[1] <- "Gene"  # Rename the gene column for clarity
+
+# Create a new column "Direction" to classify genes:
+# Upregulated: padj < 0.05, log2FoldChange > 1
+# Downregulated: padj < 0.05, log2FoldChange < -1
+# Not Significant: otherwise
+deg <- deg %>% mutate(Direction = case_when(
+  padj < 0.05 & log2FoldChange > 1 ~ "Upregulated",
+  padj < 0.05 & log2FoldChange < -1 ~ "Downregulated",
+  TRUE ~ "Not Significant"
+))
+
+# Select the top 15 significant genes (based on lowest padj) for labeling
+top15 <- deg %>% 
+  filter(Direction != "Not Significant") %>% 
+  arrange(padj) %>% 
+  head(15)
+
+# Create the volcano plot
+volcano_plot <- ggplot(deg, aes(x = log2FoldChange, y = -log10(pvalue), color = Direction)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  # Assign colors: red for upregulated, blue for downregulated, grey for non-significant
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "grey")) +
+  theme_bw() +
+  xlab("Log₂ Fold Change") +
+  ylab("-Log₁₀ p-value") +
+  ggtitle("Differential Gene Expression of WT v CR Infected Macrophages") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  # Add labels for the top 15 genes only
+  geom_text_repel(data = top15,
+                  aes(label = Gene),
+                  size = 3,
+                  box.padding = 0.3,
+                  point.padding = 0.3,
+                  )
+
+# Display the plot
+print(volcano_plot)
+
+# Save the plot to a file (e.g., PNG format)
+ggsave("volcano_plot_colored.png", plot = volcano_plot, width = 8, height = 6, dpi = 300)
+
+
+######Saving all files
+#Looping for Reactome and Volcano Plots for all comparisons
+############################################################################################################
+##How to do a loop of volcano plots and Reactome for all comparisons 
+
+# Load libraries
+library(ReactomePA)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+
+comparisons <- c("WI_CI","WN_CN","WN_WI","CN_CI")
+
+
+# choose an output folder
+output_dir <- rstudioapi::selectDirectory("Select folder to save all plots")
+
+
+# Confirm where we’ll save everything
+cat("👉 All plots will be written to:\n", output_dir, "\n\n")
+
+
+for(comp in comparisons) {
+  message("=== Running for comparison: ", comp, " ===")
+  
+  # 1) Read DEGs
+  deg <- read.csv(paste0("DEG_", comp, ".csv"), stringsAsFactors=FALSE)
+  names(deg)[1] <- "Gene"
+  
+  # 2) Reactome enrichment on all sig. DEGs
+  sig <- deg[deg$padj < 0.05 & abs(deg$log2FoldChange) > 1, ]
+  entrez <- bitr(sig$Gene, "SYMBOL","ENTREZID", OrgDb=org.Mm.eg.db)
+  react_res <- enrichPathway(entrez$ENTREZID, organism="mouse", pvalueCutoff=0.05, readable=TRUE)
+  
+  # 3) Build & title the dotplot
+  p_react <- dotplot(react_res) +
+    ggtitle(paste("Reactome pathways —", comp)) +
+    theme(plot.title=element_text(hjust=0.5))
+  print(p_react)
+  
+  # 4) Save it as PDF & PNG
+  ggsave(
+    filename = file.path(output_dir, paste0("reactome_dotplot_", comp, ".pdf")),
+    plot     = p_react,
+    width    = 8, height = 6
+  )
+  ggsave(
+    filename = file.path(output_dir, paste0("reactome_dotplot_", comp, ".png")),
+    plot     = p_react,
+    width    = 8, height = 6, dpi = 150
+  )
+  
+  # 5) Volcano plot
+  deg <- deg %>% 
+    mutate(Direction = case_when(
+      padj < 0.05 & log2FoldChange > 1  ~ "Upregulated",
+      padj < 0.05 & log2FoldChange < -1 ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    ))
+  top15 <- deg %>% filter(Direction!="Not Significant") %>% arrange(padj) %>% head(15)
+  
+  p_volc <- ggplot(deg, aes(log2FoldChange, -log10(pvalue), color=Direction)) +
+    geom_point(alpha=0.8, size=1.5) +
+    scale_color_manual(values=c("Upregulated"="red","Downregulated"="blue","Not Significant"="grey")) +
+    theme_bw() +
+    xlab("Log₂ Fold Change") + ylab("-Log₁₀ p-value") +
+    ggtitle(paste("Volcano plot —", comp)) +
+    theme(plot.title=element_text(hjust=0.5)) +
+    geom_text_repel(data=top15, aes(label=Gene), size=3,
+                    box.padding=0.3, point.padding=0.3)
+  print(p_volc)
+  
+  ggsave(
+    filename = file.path(output_dir, paste0("volcano_plot_", comp, ".png")),
+    plot     = p_volc,
+    width    = 8, height = 6, dpi = 300
+  )
+}
+
+# … after you build p_react …
+print(p_react)      # sends it to the active graphics device (e.g. RStudio Plots pane)
+
+# … after you build p_volc …
+print(p_volc)       # same for the volcano plot
+
+cat("\n✅ Done! Files in output directory:\n")
+print(list.files(output_dir, pattern="\\.(png|pdf)$"))
+
+
+
+
+
+
+
+###Individual running for comparisons ###############
+
+######################################################################################################
+##KEGG and GO individal runs for comparisons 
 ################################################################################################################################################################
 ###KEGG Pathway Analysis###
 
@@ -119,7 +353,7 @@ gene.df <- gene.df[!duplicated(gene.df$SYMBOL), ]
 # You can then proceed with your KEGG enrichment analysis using the converted IDs
 ##KEGG over ALL conditions
 kegg_results <- enrichKEGG(gene         = gene.df$ENTREZID,
-                           organism     = 'mmu',   # 'hsa' for human
+                           organism     = 'mmu',   
                            pvalueCutoff = 0.05) #Pathways with p- value less than 0.05 considered significant
 
 dotplot(kegg_results) #For all conditions 
@@ -206,44 +440,6 @@ print(kegg_WN_CN)
 dotplot(kegg_WN_CN)
 barplot(kegg_WN_CN)
 
-##########################################################################################################################
-# Function to create a volcano plot using base R
-volcano_plot <- function(res, title, topN = 5) {
-  df <- as.data.frame(res)
-  # Create the base plot
-  plot(df$log2FoldChange, -log10(df$padj),
-       pch = 20, main = title,
-       xlab = "Log2 Fold Change", ylab = "-Log10 Adjusted P-value",
-       col = "gray")
-  
-  
-  # Identify significant points
-  significant <- which(df$padj < 0.05 & abs(df$log2FoldChange) > 1)
-  
-  # Add colored points for significant genes
-  points(df$log2FoldChange[significant],
-         -log10(df$padj)[significant],
-         pch = 20, col = "pink")
-  
-  # Only label the topN significant genes sorted by lowest padj
-  if (length(significant) > 0) {
-    ordered_sig <- significant[order(df$padj[significant])]
-    top_genes <- head(ordered_sig, topN)
-    
-    text(df$log2FoldChange[top_genes],
-         -log10(df$padj)[top_genes],
-         labels = rownames(df)[top_genes],
-         pos = 3, cex = 0.8, col = "purple")
-  }
-}
-
-
-
-# Create volcano plots for each comparison
-volcano_plot(res_WN_WI, "Volcano Plot: WN vs WI", topN = 10)
-volcano_plot(res_CN_CI, "Volcano Plot: CN vs CI", topN = 10)
-volcano_plot(res_WI_CI, "Volcano Plot: WI vs CI", topN = 10)
-volcano_plot(res_WN_CN, "Volcano Plot: WN vs CN" , topN = 10)
 
 ###########################################################################################################################################################
 ##GO analysis 
@@ -296,14 +492,54 @@ go_WN_CN <- enrichGO(gene          = gene.df_WN_CN$ENTREZID,
 dotplot(go_WN_CN, showCategory = 10)
 barplot(go_WN_CN, showCategory = 10)
 
+### — Save all generated KEGG & GO plots — ###
 
+# Re‑compute and collect plots into a named list
+plots <- list(
+  kegg_all_dot    = dotplot(kegg_results),
+  kegg_all_bar    = barplot(kegg_results),
+  
+  WN_WI_kegg_dot  = dotplot(kegg_WN_WI),
+  WN_WI_kegg_bar  = barplot(kegg_WN_WI),
+  
+  CN_CI_kegg_dot  = dotplot(kegg_CN_CI),
+  CN_CI_kegg_bar  = barplot(kegg_CN_CI),
+  
+  WI_CI_kegg_dot  = dotplot(kegg_WI_CI),
+  WI_CI_kegg_bar  = barplot(kegg_WI_CI),
+  
+  WN_CN_kegg_dot  = dotplot(kegg_WN_CN),
+  WN_CN_kegg_bar  = barplot(kegg_WN_CN),
+  
+  WN_WI_go_dot    = dotplot(go_WN_WI, showCategory = 10),
+  WN_WI_go_bar    = barplot(go_WN_WI, showCategory = 10),
+  
+  CN_CI_go_dot    = dotplot(go_CN_CI, showCategory = 10),
+  CN_CI_go_bar    = barplot(go_CN_CI, showCategory = 10),
+  
+  WI_CI_go_dot    = dotplot(go_WI_CI, showCategory = 10),
+  WI_CI_go_bar    = barplot(go_WI_CI, showCategory = 10),
+  
+  WN_CN_go_dot    = dotplot(go_WN_CN, showCategory = 10),
+  WN_CN_go_bar    = barplot(go_WN_CN, showCategory = 10)
+)
 
+# Loop over the list and save each plot
+for (nm in names(plots)) {
+  ggsave(
+    filename = paste0(nm, ".png"),
+    plot     = plots[[nm]],
+    width    = 8,
+    height   = 6,
+    dpi      = 300
+  )
+}
 
+##############################################################################################################
+#Running the Reactome one at a time without looping
+#########################################################################
 
-
-
-##################################################################################################################################################
-##Reactome pathway analysis
+##Reactome pathway analysis Do the rest of this code individually for each comparison
 
 # Install required packages if not already installed
 if (!requireNamespace("BiocManager", quietly = TRUE))
@@ -388,55 +624,27 @@ dev.off()  # Close the device and write the file
 png("reactome_dotplot.png", width = 800, height = 600, res = 150)
 dotplot(reactome_results)
 dev.off()
+# Alternatively, exporting as a PNG file
+png("reactome_dotplot.png", width = 800, height = 600, res = 150)
+dotplot(reactome_up)
+dev.off()
 
 
+##############################################################################################################
+##How to look at genes responsible for this
 
+# Convert the enrichment results to a data frame
+reactome_df <- as.data.frame(reactome_down)
 
+# Iterate over each enriched pathway and print the pathway description and its genes
+for(i in 1:nrow(reactome_df)) {
+  cat("Pathway:", reactome_df$Description[i], "\n")
+  # Split the geneID string to obtain individual gene symbols
+  pathway_genes <- strsplit(reactome_df$geneID[i], "/")[[1]]
+  cat("Genes:", paste(pathway_genes, collapse = ", "), "\n\n")
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# Alternatively, store the genes in a list for further analysis
+pathway_genes_list <- lapply(reactome_df$geneID, function(x) strsplit(x, "/")[[1]])
+names(pathway_genes_list) <- reactome_df$Description
 
